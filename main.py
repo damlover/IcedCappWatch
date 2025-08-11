@@ -60,9 +60,10 @@ def refresh_materialized_view():
 
 # ========= Appel GraphQL (POST) =========
 def fetch_store_menu(store_id: str):
-    # storeMenu a besoin de: storeId: ID!, region: String!, channel: Channel!
-    query = """query StoreMenu($storeId: ID!, $region: String!, $channel: Channel!) {
-      storeMenu(storeId: $storeId, region: $region, channel: $channel) {
+    # storeMenu exige storeId: ID!, region: String!, channel: Channel!
+    # serviceMode semble souvent utilisé ("pickup"), on l'ajoute aussi
+    query = """query StoreMenu($storeId: ID!, $region: String!, $channel: Channel!, $serviceMode: ServiceMode) {
+      storeMenu(storeId: $storeId, region: $region, channel: $channel, serviceMode: $serviceMode) {
         id
         isAvailable
         price { default }
@@ -70,12 +71,13 @@ def fetch_store_menu(store_id: str):
     }"""
 
     variables = {
-        "storeId": store_id,                                 # ID! → sérialisé string OK
-        "region": os.environ.get("TIMS_REGION", "CA"),       # <- ajoute TIMS_REGION
-        "channel": os.environ.get("TIMS_CHANNEL", "WEB")     # <- ajoute TIMS_CHANNEL
+        "storeId": store_id,
+        "region": os.environ.get("TIMS_REGION", "CA"),
+        "channel": os.environ.get("TIMS_CHANNEL", "whitelabel"),
+        "serviceMode": "pickup"
     }
 
-    # Variables additionnelles facultatives (si tu veux surcharger via env JSON)
+    # Surcharge éventuelle depuis l'env
     extra_vars = os.environ.get("TIMS_EXTRA_VARIABLES_JSON")
     if extra_vars:
         try:
@@ -90,30 +92,21 @@ def fetch_store_menu(store_id: str):
         "origin": "https://www.timhortons.ca",
         "referer": "https://www.timhortons.ca/",
     }
-    # Entêtes additionnelles optionnelles depuis l'env
     extra_headers = os.environ.get("TIMS_HEADERS_JSON")
     if extra_headers:
         try:
             headers.update(json.loads(extra_headers))
         except Exception:
             pass
-
-    if TIMS_AUTH:
-        headers["authorization"] = TIMS_AUTH
-    if TIMS_COOKIE:
-        headers["cookie"] = TIMS_COOKIE
+    if TIMS_AUTH: headers["authorization"] = TIMS_AUTH
+    if TIMS_COOKIE: headers["cookie"] = TIMS_COOKIE
 
     r = requests.post(
         TIMS_GATEWAY_URL,
-        json={
-            "operationName": "StoreMenu",
-            "variables": variables,
-            "query": query
-        },
+        json={"operationName": "StoreMenu", "variables": variables, "query": query},
         headers=headers,
         timeout=25
     )
-
     if r.status_code != 200:
         print("DEBUG gateway status:", r.status_code, file=sys.stderr)
         print("DEBUG gateway body:", r.text[:1000], file=sys.stderr)
