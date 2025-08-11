@@ -60,56 +60,61 @@ def refresh_materialized_view():
 
 # ========= Appel GraphQL (POST) =========
 def fetch_store_menu(store_id: str):
-    # Query minimale — ajuste si le gateway attend d'autres champs
-    query = """query StoreMenu($storeId:String!){
-      storeMenu(storeId:$storeId){ id isAvailable price { default } }
+    # storeMenu a besoin de: storeId: ID!, region: String!, channel: Channel!
+    query = """query StoreMenu($storeId: ID!, $region: String!, $channel: Channel!) {
+      storeMenu(storeId: $storeId, region: $region, channel: $channel) {
+        id
+        isAvailable
+        price { default }
+      }
     }"""
-    variables = {"storeId": store_id}
 
-    # Variables supplémentaires depuis l'env
-    if TIMS_EXTRA_VARIABLES_JSON:
+    variables = {
+        "storeId": store_id,                                 # ID! → sérialisé string OK
+        "region": os.environ.get("TIMS_REGION", "CA"),       # <- ajoute TIMS_REGION
+        "channel": os.environ.get("TIMS_CHANNEL", "WEB")     # <- ajoute TIMS_CHANNEL
+    }
+
+    # Variables additionnelles facultatives (si tu veux surcharger via env JSON)
+    extra_vars = os.environ.get("TIMS_EXTRA_VARIABLES_JSON")
+    if extra_vars:
         try:
-            variables.update(json.loads(TIMS_EXTRA_VARIABLES_JSON))
-        except Exception as e:
-            print("WARN bad TIMS_EXTRA_VARIABLES_JSON:", e, file=sys.stderr)
+            variables.update(json.loads(extra_vars))
+        except Exception:
+            pass
 
     headers = {
         "accept": "application/json",
         "content-type": "application/json",
         "user-agent": TIMS_UA,
-        # Souvent nécessaires pour passer les protections côté gateway web:
         "origin": "https://www.timhortons.ca",
         "referer": "https://www.timhortons.ca/",
     }
-
-    # Entêtes additionnelles
-    if TIMS_HEADERS_JSON:
+    # Entêtes additionnelles optionnelles depuis l'env
+    extra_headers = os.environ.get("TIMS_HEADERS_JSON")
+    if extra_headers:
         try:
-            headers.update(json.loads(TIMS_HEADERS_JSON))
-        except Exception as e:
-            print("WARN bad TIMS_HEADERS_JSON:", e, file=sys.stderr)
+            headers.update(json.loads(extra_headers))
+        except Exception:
+            pass
 
     if TIMS_AUTH:
         headers["authorization"] = TIMS_AUTH
     if TIMS_COOKIE:
         headers["cookie"] = TIMS_COOKIE
 
-    try:
-        r = requests.post(
-            TIMS_GATEWAY_URL,
-            json={
-                "operationName": "StoreMenu",
-                "variables": variables,
-                "query": query
-            },
-            headers=headers,
-            timeout=25
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(f"Gateway request failed: {e}")
+    r = requests.post(
+        TIMS_GATEWAY_URL,
+        json={
+            "operationName": "StoreMenu",
+            "variables": variables,
+            "query": query
+        },
+        headers=headers,
+        timeout=25
+    )
 
     if r.status_code != 200:
-        # Log le corps pour comprendre un 4xx/5xx
         print("DEBUG gateway status:", r.status_code, file=sys.stderr)
         print("DEBUG gateway body:", r.text[:1000], file=sys.stderr)
         raise RuntimeError(f"Gateway HTTP {r.status_code}")
@@ -118,6 +123,7 @@ def fetch_store_menu(store_id: str):
     if "errors" in data:
         print("DEBUG gql errors:", data["errors"], file=sys.stderr)
     return data.get("data", {}).get("storeMenu", [])
+
 
 
 # ========= Matching produit / name =========
