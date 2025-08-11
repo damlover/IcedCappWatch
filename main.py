@@ -60,9 +60,8 @@ def refresh_materialized_view():
 
 # ========= Appel GraphQL (POST) =========
 def fetch_store_menu(store_id: str):
-    # storeMenu exige storeId: ID!, region: String!, channel: Channel!
-    # serviceMode semble souvent utilisé ("pickup"), on l'ajoute aussi
-    query = """query StoreMenu($storeId: ID!, $region: String!, $channel: Channel!, $serviceMode: ServiceMode) {
+    # storeMenu exige: storeId: ID!, region: String!, channel: Channel!, serviceMode: PosDataServiceMode
+    query = """query StoreMenu($storeId: ID!, $region: String!, $channel: Channel!, $serviceMode: PosDataServiceMode) {
       storeMenu(storeId: $storeId, region: $region, channel: $channel, serviceMode: $serviceMode) {
         id
         isAvailable
@@ -74,14 +73,16 @@ def fetch_store_menu(store_id: str):
         "storeId": store_id,
         "region": os.environ.get("TIMS_REGION", "CA"),
         "channel": os.environ.get("TIMS_CHANNEL", "whitelabel"),
-        "serviceMode": "pickup"
+        "serviceMode": os.environ.get("TIMS_SERVICE_MODE", "PICKUP")
     }
 
-    # Surcharge éventuelle depuis l'env
+    # (facultatif) autres vars JSON sans toucher à serviceMode
     extra_vars = os.environ.get("TIMS_EXTRA_VARIABLES_JSON")
     if extra_vars:
         try:
-            variables.update(json.loads(extra_vars))
+            extra = json.loads(extra_vars)
+            extra.pop("serviceMode", None)  # ne pas écraser
+            variables.update(extra)
         except Exception:
             pass
 
