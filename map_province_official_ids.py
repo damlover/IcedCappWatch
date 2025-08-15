@@ -52,11 +52,9 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
 
 def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
     """
-    Essaie d'abord d'utiliser la requête fournie via l'env:
-      - TIMS_NEARBY_OPERATION
-      - TIMS_NEARBY_QUERY   (colle ici la requête GraphQL exacte du HAR)
-    Si non définies, on ne tente rien (pour éviter des 400 en boucle) et on t'affiche
-    la liste des champs Query disponibles si l'introspection est permise.
+    Si TIMS_NEARBY_OPERATION + TIMS_NEARBY_QUERY sont fournis:
+      - Si la requête GraphQL attend $input: ..., on construit variables={"input": {...}}
+      - Sinon, on envoie variables à plat (region, channel, serviceMode, lat, lon, limit)
     """
     headers = {
         "accept":"application/json",
@@ -71,26 +69,50 @@ def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
     if TIMS_AUTH: headers["authorization"] = TIMS_AUTH
     if TIMS_COOKIE: headers["cookie"] = TIMS_COOKIE
 
-    # 1) Si tu fournis la requête via les variables d'env, on l'utilise telle quelle
-    op = os.environ.get("TIMS_NEARBY_OPERATION")
+    op  = os.environ.get("TIMS_NEARBY_OPERATION")
     qry = os.environ.get("TIMS_NEARBY_QUERY")
+
     if op and qry:
-        variables = {
-            "region": REGION,
-            "channel": CHANNEL,
-            "serviceMode": SMODE,
-            "lat": float(lat),
-            "lon": float(lon),
-            "limit": int(limit)
-        }
-        if EXTRA_VARS:
-            try:
-                extra = json.loads(EXTRA_VARS)
-                for k in ["lat","lon","region","channel","serviceMode"]:
-                    extra.pop(k, None)
-                variables.update(extra)
-            except Exception as e:
-                print("WARN bad TIMS_EXTRA_VARIABLES_JSON:", e, file=sys.stderr)
+        # Détermine si la requête attend un $input
+        expects_input = "($input" in qry or "$input:" in qry
+
+        if expects_input:
+            # Construit l'objet input par défaut
+            input_obj = {
+                "filter": os.environ.get("TIMS_NEARBY_FILTER", "NEARBY"),
+                "region": REGION,
+                "channel": CHANNEL,
+                "serviceMode": SMODE,
+                "location": {"latitude": float(lat), "longitude": float(lon)},
+                "limit": int(limit)
+            }
+            # Permet des champs additionnels/corrections via JSON (ex: {"pageSize":10})
+            extra_input = os.environ.get("TIMS_NEARBY_INPUT_MERGE_JSON")
+            if extra_input:
+                try:
+                    input_obj.update(json.loads(extra_input))
+                except Exception as e:
+                    print("WARN bad TIMS_NEARBY_INPUT_MERGE_JSON:", e, file=sys.stderr)
+
+            variables = {"input": input_obj}
+        else:
+            # Ancien mode: variables à plat
+            variables = {
+                "region": REGION,
+                "channel": CHANNEL,
+                "serviceMode": SMODE,
+                "lat": float(lat),
+                "lon": float(lon),
+                "limit": int(limit)
+            }
+            if EXTRA_VARS:
+                try:
+                    extra = json.loads(EXTRA_VARS)
+                    for k in ["lat","lon","region","channel","serviceMode"]:
+                        extra.pop(k, None)
+                    variables.update(extra)
+                except Exception as e:
+                    print("WARN bad TIMS_EXTRA_VARIABLES_JSON:", e, file=sys.stderr)
 
         r = requests.post(TIMS_GATEWAY_URL, json={
             "operationName": op,
@@ -108,13 +130,17 @@ def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
             return []
 
         root = data.get("data", {})
-        # essaie d’extraire le premier tableau retourné
+        # Essaie de trouver le premier tableau retourné (souvent items/list)
         for v in root.values():
             if isinstance(v, list):
                 return v
+            if isinstance(v, dict):
+                # certains schémas retournent { items: [...] }
+                if "items" in v and isinstance(v["items"], list):
+                    return v["items"]
         return []
 
-    # 2) Sinon: on tente une introspection pour tister les champs disponibles
+    # Si pas de requête fournie, on affiche juste un hint (introspection)
     try:
         introspect = requests.post(
             TIMS_GATEWAY_URL,
@@ -127,7 +153,7 @@ def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
                                               .get("__schema", {})
                                               .get("queryType", {})
                                               .get("fields", []))]
-            hints = [f for f in fields if any(k in f.lower() for k in ["near","store","location","search"])]
+            hints = [f for f in fields if any(k in f.lower() for k in ["near","store","restaurant","location","search"])]
             print("HINT Query fields:", fields[:30], file=sys.stderr)
             print("HINT candidates:", hints, file=sys.stderr)
         else:
@@ -136,6 +162,7 @@ def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
         print("Introspection error:", e, file=sys.stderr)
 
     return []
+
 
 
 def best_candidate(lat: float, lon: float, cands: List[Dict[str,Any]]) -> Optional[Tuple[str,float]]:
