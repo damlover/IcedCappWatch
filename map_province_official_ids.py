@@ -52,9 +52,10 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
 
 def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
     """
-    Si TIMS_NEARBY_OPERATION + TIMS_NEARBY_QUERY sont fournis:
-      - Si la requête GraphQL attend $input: ..., on construit variables={"input": {...}}
-      - Sinon, on envoie variables à plat (region, channel, serviceMode, lat, lon, limit)
+    Accepte soit:
+      - TIMS_NEARBY_OPERATION + TIMS_NEARBY_QUERY = texte GraphQL ("query GetRestaurants(...) { ... }")
+      - TIMS_NEARBY_QUERY = JSON brut du payload DevTools (objet ou tableau d'objets)
+        -> on extrait automatiquement operationName, query et, si présent, variables.input
     """
     headers = {
         "accept":"application/json",
@@ -70,75 +71,109 @@ def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
     if TIMS_COOKIE: headers["cookie"] = TIMS_COOKIE
 
     op  = os.environ.get("TIMS_NEARBY_OPERATION")
-    qry = os.environ.get("TIMS_NEARBY_QUERY")
+    raw = os.environ.get("TIMS_NEARBY_QUERY")  # peut être du texte GraphQL OU du JSON
 
-    if op and qry:
-        # Détermine si la requête attend un $input
-        expects_input = "($input" in qry or "$input:" in qry
+    qry = None
+    payload_vars = {}
 
-        if expects_input:
-            # Construit l'objet input par défaut
-            input_obj = {
-                "filter": os.environ.get("TIMS_NEARBY_FILTER", "NEARBY"),
-                "region": REGION,
-                "channel": CHANNEL,
-                "serviceMode": SMODE,
-                "location": {"latitude": float(lat), "longitude": float(lon)},
-                "limit": int(limit)
-            }
-            # Permet des champs additionnels/corrections via JSON (ex: {"pageSize":10})
-            extra_input = os.environ.get("TIMS_NEARBY_INPUT_MERGE_JSON")
-            if extra_input:
-                try:
-                    input_obj.update(json.loads(extra_input))
-                except Exception as e:
-                    print("WARN bad TIMS_NEARBY_INPUT_MERGE_JSON:", e, file=sys.stderr)
+    # Si la valeur ressemble à du JSON (commence par [ ou {]), on essaie d'extraire
+    if raw and raw.strip()[:1] in "[{":
+        try:
+            blob = json.loads(raw)
+            # Prend le 1er objet pertinent
+            if isinstance(blob, list) and blob:
+                entry = blob[0]
+            elif isinstance(blob, dict):
+                entry = blob
+            else:
+                entry = None
+            if entry:
+                op = entry.get("operationName") or op
+                qry = entry.get("query") or qry
+                payload_vars = entry.get("variables") or {}
+        except Exception as e:
+            print("WARN TIMS_NEARBY_QUERY not valid JSON:", e, file=sys.stderr)
+    else:
+        qry = raw
 
-            variables = {"input": input_obj}
-        else:
-            # Ancien mode: variables à plat
-            variables = {
-                "region": REGION,
-                "channel": CHANNEL,
-                "serviceMode": SMODE,
-                "lat": float(lat),
-                "lon": float(lon),
-                "limit": int(limit)
-            }
-            if EXTRA_VARS:
-                try:
-                    extra = json.loads(EXTRA_VARS)
-                    for k in ["lat","lon","region","channel","serviceMode"]:
-                        extra.pop(k, None)
-                    variables.update(extra)
-                except Exception as e:
-                    print("WARN bad TIMS_EXTRA_VARIABLES_JSON:", e, file=sys.stderr)
-
-        r = requests.post(TIMS_GATEWAY_URL, json={
-            "operationName": op,
-            "variables": variables,
-            "query": qry
-        }, headers=headers, timeout=25)
-
-        if r.status_code != 200:
-            print("DEBUG nearby status:", r.status_code, "body:", r.text[:700], file=sys.stderr)
-            return []
-
-        data = r.json()
-        if "errors" in data:
-            print("DEBUG nearby gql errors:", data["errors"], file=sys.stderr)
-            return []
-
-        root = data.get("data", {})
-        # Essaie de trouver le premier tableau retourné (souvent items/list)
-        for v in root.values():
-            if isinstance(v, list):
-                return v
-            if isinstance(v, dict):
-                # certains schémas retournent { items: [...] }
-                if "items" in v and isinstance(v["items"], list):
-                    return v["items"]
+    if not (op and qry):
+        print("Missing TIMS_NEARBY_OPERATION / TIMS_NEARBY_QUERY", file=sys.stderr)
         return []
+
+    # Construit les variables pour l'appel
+    expects_input = "($input" in qry or "$input:" in qry
+    if expects_input:
+        input_obj = {
+            "filter": os.environ.get("TIMS_NEARBY_FILTER", "NEARBY"),
+            "region": REGION,
+            "channel": CHANNEL,
+            "serviceMode": SMODE,
+            "location": {"latitude": float(lat), "longitude": float(lon)},
+            "limit": int(limit)
+        }
+        # fusionne ce qui vient du payload JSON (variables.input)
+        try:
+            p_input = payload_vars.get("input") if isinstance(payload_vars, dict) else None
+            if isinstance(p_input, dict):
+                # n'écrase pas location/limit/region/channel/serviceMode par prudence
+                extra = dict(p_input)
+                for k in ["location","limit","region","channel","serviceMode"]:
+                    extra.pop(k, None)
+                input_obj.update(extra)
+        except Exception:
+            pass
+        # et ce qui vient d'une surcouche manuelle
+        extra_input = os.environ.get("TIMS_NEARBY_INPUT_MERGE_JSON")
+        if extra_input:
+            try:
+                input_obj.update(json.loads(extra_input))
+            except Exception as e:
+                print("WARN bad TIMS_NEARBY_INPUT_MERGE_JSON:", e, file=sys.stderr)
+
+        variables = {"input": input_obj}
+    else:
+        variables = {
+            "region": REGION,
+            "channel": CHANNEL,
+            "serviceMode": SMODE,
+            "lat": float(lat),
+            "lon": float(lon),
+            "limit": int(limit)
+        }
+        if EXTRA_VARS:
+            try:
+                extra = json.loads(EXTRA_VARS)
+                for k in ["lat","lon","region","channel","serviceMode"]:
+                    extra.pop(k, None)
+                variables.update(extra)
+            except Exception as e:
+                print("WARN bad TIMS_EXTRA_VARIABLES_JSON:", e, file=sys.stderr)
+
+    r = requests.post(
+        TIMS_GATEWAY_URL,
+        json={"operationName": op, "variables": variables, "query": qry},
+        headers=headers,
+        timeout=25
+    )
+
+    if r.status_code != 200:
+        print("DEBUG nearby status:", r.status_code, "body:", r.text[:700], file=sys.stderr)
+        return []
+
+    data = r.json()
+    if "errors" in data:
+        print("DEBUG nearby gql errors:", data["errors"], file=sys.stderr)
+        return []
+
+    # essaie de trouver un tableau de magasins dans la réponse
+    root = data.get("data", {})
+    for v in root.values():
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict) and "items" in v and isinstance(v["items"], list):
+            return v["items"]
+    return []
+
 
     # Si pas de requête fournie, on affiche juste un hint (introspection)
     try:
