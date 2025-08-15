@@ -36,6 +36,10 @@ ITEM_PATTERNS = [p.strip() for p in os.environ.get(
 PATTERNS = [re.compile(p, re.I) for p in ITEM_PATTERNS]
 
 # ========= Helpers DB =========
+def get_store_batch(offset: int, limit: int):
+    # On lit depuis la vue "stores_official" pour ignorer les kgl_* synthétiques
+    res = sb.table("stores_official").select("*").order("store_id").range(offset, offset + limit - 1).execute()
+    return res.data or []
 def upsert_item_basic(item_id: str, name: str | None):
     try:
         family = "iced_capp" if (name and any(p.search(name) for p in PATTERNS)) else None
