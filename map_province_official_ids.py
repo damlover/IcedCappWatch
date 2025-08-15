@@ -50,7 +50,14 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     a = sin(dphi/2)**2 + cos(phi1)*cos(phi2)*sin(dl/2)**2
     return 2 * R * atan2(sqrt(a), sqrt(1 - a))
 
-def fetch_nearby(lat: float, lon: float, limit: int = 5) -> List[Dict[str,Any]]:
+def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
+    """
+    Essaie d'abord d'utiliser la requête fournie via l'env:
+      - TIMS_NEARBY_OPERATION
+      - TIMS_NEARBY_QUERY   (colle ici la requête GraphQL exacte du HAR)
+    Si non définies, on ne tente rien (pour éviter des 400 en boucle) et on t'affiche
+    la liste des champs Query disponibles si l'introspection est permise.
+    """
     headers = {
         "accept":"application/json",
         "content-type":"application/json",
@@ -64,46 +71,72 @@ def fetch_nearby(lat: float, lon: float, limit: int = 5) -> List[Dict[str,Any]]:
     if TIMS_AUTH: headers["authorization"] = TIMS_AUTH
     if TIMS_COOKIE: headers["cookie"] = TIMS_COOKIE
 
-    variables = {
-        "region": REGION,
-        "channel": CHANNEL,
-        "serviceMode": SMODE,
-        "lat": float(lat),
-        "lon": float(lon),
-        "limit": int(limit),
-    }
-    if EXTRA_VARS:
-        try:
-            extra = json.loads(EXTRA_VARS)
-            for k in ["lat","lon","region","channel","serviceMode"]:
-                extra.pop(k, None)
-            variables.update(extra)
-        except Exception as e:
-            print("WARN bad TIMS_EXTRA_VARIABLES_JSON:", e, file=sys.stderr)
+    # 1) Si tu fournis la requête via les variables d'env, on l'utilise telle quelle
+    op = os.environ.get("TIMS_NEARBY_OPERATION")
+    qry = os.environ.get("TIMS_NEARBY_QUERY")
+    if op and qry:
+        variables = {
+            "region": REGION,
+            "channel": CHANNEL,
+            "serviceMode": SMODE,
+            "lat": float(lat),
+            "lon": float(lon),
+            "limit": int(limit)
+        }
+        if EXTRA_VARS:
+            try:
+                extra = json.loads(EXTRA_VARS)
+                for k in ["lat","lon","region","channel","serviceMode"]:
+                    extra.pop(k, None)
+                variables.update(extra)
+            except Exception as e:
+                print("WARN bad TIMS_EXTRA_VARIABLES_JSON:", e, file=sys.stderr)
 
-    r = requests.post(TIMS_GATEWAY_URL, json={
-        "operationName": NEARBY_OPERATION,
-        "variables": variables,
-        "query": NEARBY_QUERY
-    }, headers=headers, timeout=25)
+        r = requests.post(TIMS_GATEWAY_URL, json={
+            "operationName": op,
+            "variables": variables,
+            "query": qry
+        }, headers=headers, timeout=25)
 
-    if r.status_code != 200:
-        print("DEBUG nearby status:", r.status_code, "body:", r.text[:500], file=sys.stderr)
+        if r.status_code != 200:
+            print("DEBUG nearby status:", r.status_code, "body:", r.text[:700], file=sys.stderr)
+            return []
+
+        data = r.json()
+        if "errors" in data:
+            print("DEBUG nearby gql errors:", data["errors"], file=sys.stderr)
+            return []
+
+        root = data.get("data", {})
+        # essaie d’extraire le premier tableau retourné
+        for v in root.values():
+            if isinstance(v, list):
+                return v
         return []
 
-    data = r.json()
-    if "errors" in data:
-        print("DEBUG nearby gql errors:", data["errors"], file=sys.stderr)
-        return []
+    # 2) Sinon: on tente une introspection pour tister les champs disponibles
+    try:
+        introspect = requests.post(
+            TIMS_GATEWAY_URL,
+            json={"query": "query __I{ __schema { queryType { fields { name } } } }"},
+            headers=headers, timeout=15
+        )
+        if introspect.status_code == 200:
+            info = introspect.json()
+            fields = [f.get("name") for f in (info.get("data", {})
+                                              .get("__schema", {})
+                                              .get("queryType", {})
+                                              .get("fields", []))]
+            hints = [f for f in fields if any(k in f.lower() for k in ["near","store","location","search"])]
+            print("HINT Query fields:", fields[:30], file=sys.stderr)
+            print("HINT candidates:", hints, file=sys.stderr)
+        else:
+            print("Introspection not available (status", introspect.status_code, ")", file=sys.stderr)
+    except Exception as e:
+        print("Introspection error:", e, file=sys.stderr)
 
-    root = data.get("data", {})
-    arr = root.get("nearbyStores")
-    if isinstance(arr, list):
-        return arr
-    for v in root.values():
-        if isinstance(v, list):
-            return v
     return []
+
 
 def best_candidate(lat: float, lon: float, cands: List[Dict[str,Any]]) -> Optional[Tuple[str,float]]:
     best = (None, 1e12)
