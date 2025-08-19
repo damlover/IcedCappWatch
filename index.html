@@ -4,22 +4,218 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>IcedCappWatch</title>
+
+  <!-- Mapbox -->
+  <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+
+  <!-- Supabase -->
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+
   <style>
-    html,body{margin:0;height:100%;background:#0b0f14;color:#e6e6e6;font:16px/1.4 system-ui,Segoe UI,Roboto}
-    .wrap{max-width:720px;margin:10vh auto;padding:24px}
-    .card{background:#0f1720;border:1px solid #1f2937;border-radius:16px;padding:24px}
-    .btn{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:10px;background:#111827;color:#e5e7eb;text-decoration:none}
-    .btn:hover{background:#1f2937}
+    :root{
+      --bg:#0b0f14; --panel:#0f1720; --muted:#94a3b8; --text:#e5e7eb; --accent:#60a5fa;
+      --green:#22c55e; --red:#ef4444; --gray:#64748b; --border:#1f2937;
+    }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,Segoe UI,Roboto,Inter}
+    .topbar{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(11,15,20,.85);backdrop-filter:saturate(140%) blur(6px);z-index:10}
+    .brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:22px}
+    .leaf{font-size:24px}
+    .kpis{display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+    .kpi{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:10px 14px;display:flex;gap:10px;align-items:baseline}
+    .kpi .v{font-size:22px;font-weight:800}
+    .kpi .lbl{font-size:12px;color:var(--muted)}
+    #map{position:fixed;inset:64px 0 0 0}
+    .panel{position:absolute;right:16px;top:84px;width:320px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px 14px 10px;z-index:5}
+    .row{display:flex;gap:10px;align-items:center;margin:6px 0}
+    select,button{background:#0b1220;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 10px;font:inherit}
+    button{cursor:pointer}
+    .legend{display:flex;gap:10px;align-items:center;margin-top:8px;font-size:14px;color:var(--muted)}
+    .dot{width:10px;height:10px;border-radius:999px;display:inline-block}
+    .g{background:var(--green)} .r{background:var(--red)} .x{background:var(--gray)}
+    .footer{position:absolute;left:16px;bottom:16px;background:rgba(15,23,32,.9);border:1px solid var(--border);border-radius:10px;padding:8px 12px;color:var(--muted);font-size:12px}
+    a{color:var(--accent);text-decoration:none}
+    .toast{position:fixed;right:16px;bottom:16px;background:#0b1220;border:1px solid var(--border);border-radius:12px;padding:10px 14px;display:none}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <h1>🍁 IcedCappWatch</h1>
-      <p>Le site est en ligne. La carte et le pourcentage s’activent au fur et à mesure du mappage des magasins.</p>
-      <p>Si vous voyez cette page, c’est que la route <code>/</code> était vide auparavant (erreur 404 résolue).</p>
-      <a class="btn" href="#" onclick="location.reload()">Rafraîchir</a>
+  <div class="topbar">
+    <div class="brand"><span class="leaf">🍁</span> IcedCappWatch</div>
+    <div class="kpis">
+      <div class="kpi"><span class="v" id="kpiPct">–%</span><span class="lbl" id="kpiLbl">Canada</span></div>
+      <div class="kpi"><span class="v" id="kpiCounts">–/–</span><span class="lbl">verts/total</span></div>
+      <div class="kpi"><span class="v" id="kpiUpdated">–</span><span class="lbl">dernière mise à jour</span></div>
     </div>
   </div>
+
+  <div id="map"></div>
+
+  <div class="panel">
+    <div class="row">
+      <label for="province">Province</label>
+      <select id="province">
+        <option value="ALL" selected>Toutes</option>
+      </select>
+      <button id="refresh">🔄</button>
+    </div>
+    <div class="legend">
+      <span class="dot g"></span> dispo
+      <span class="dot r"></span> indispo
+      <span class="dot x"></span> inconnu
+    </div>
+  </div>
+
+  <div class="footer">
+    Données: Supabase · Carte: Mapbox · Actualisé auto.
+  </div>
+  <div class="toast" id="toast"></div>
+
+<script>
+(async function(){
+  // ====== Config (tes clés) ======
+  const MAPBOX_TOKEN = "pk.eyJ1IjoibW9uc2lldXJkYW1pZW4yNCIsImEiOiJjbWUyNTZjZmgwb242Mmtva2R2c2Y0MTFjIn0.Bw34GGJ5w2AXxC4jkIWG_Q";
+  const SUPABASE_URL = "https://itzbjxbeuimkurbcgrhh.supabase.co";
+  const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml0emJqeGJldWlta3VyYmNncmhoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ3MDcyNDcsImV4cCI6MjA3MDI4MzI0N30.vGiMqIaFMj0x6tmWSBZtH5HP1fQZhAvtjmQ6sO5Rqrw";
+
+  // ====== Clients ======
+  mapboxgl.accessToken = MAPBOX_TOKEN;
+  const map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/mapbox/dark-v11',
+    center: [-79.38, 43.65], // Toronto par défaut
+    zoom: 4
+  });
+  const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+  const $prov = document.getElementById('province');
+  const $kpiPct = document.getElementById('kpiPct');
+  const $kpiLbl = document.getElementById('kpiLbl');
+  const $kpiCounts = document.getElementById('kpiCounts');
+  const $kpiUpdated = document.getElementById('kpiUpdated');
+  const $toast = document.getElementById('toast');
+
+  let STORE_INDEX = new Map(); // store_id -> store record
+  let LATEST = new Map();      // store_id -> latest record
+  let MARKERS = [];            // mapbox markers
+
+  function showToast(txt){
+    $toast.textContent = txt;
+    $toast.style.display='block';
+    setTimeout(()=>{$toast.style.display='none'},2200);
+  }
+
+  function isOfficialId(id){ return /^\d+$/.test(String(id||'')); }
+
+  async function fetchData(){
+    // 1) stores (points)
+    const { data: stores, error: e1 } = await supabase
+      .from('stores')
+      .select('store_id,name,address,city,province,lat,lon,active')
+      .not('lat','is',null).not('lon','is',null);
+    if(e1){ console.error(e1); showToast('Erreur lecture stores'); }
+
+    STORE_INDEX = new Map((stores || []).map(s => [s.store_id, s]));
+
+    // 2) latest states
+    const { data: latest, error: e2 } = await supabase
+      .from('store_latest')
+      .select('*');
+    if(e2){ console.error(e2); showToast('Erreur lecture store_latest'); }
+
+    LATEST = new Map((latest || []).map(r => [r.store_id, r]));
+
+    // Provinces dropdown
+    const provs = Array.from(new Set((stores||[]).map(s => (s.province||'').toUpperCase()).filter(Boolean))).sort();
+    $prov.innerHTML = '<option value="ALL">Toutes</option>' + provs.map(p=>`<option value="${p}">${p}</option>`).join('');
+  }
+
+  function colorFor(store){
+    const L = LATEST.get(store.store_id);
+    if(!L) return 'gray';
+    const v = (L.is_available ?? L.last_available ?? L.available);
+    return v ? 'green' : 'red';
+  }
+
+  function updateKPIs(filteredStores){
+    let total = 0, green = 0, lastTs = 0;
+    for(const s of filteredStores){
+      const L = LATEST.get(s.store_id);
+      if(!L) continue;
+      total++;
+      const v = (L.is_available ?? L.last_available ?? L.available);
+      if(v) green++;
+      const ts = Date.parse(L.checked_at || L.last_checked_at || L.updated_at || 0);
+      if(ts && ts>lastTs) lastTs = ts;
+    }
+    const pct = total ? Math.round((green/total)*100) : 0;
+    $kpiPct.textContent = `${pct}%`;
+    $kpiCounts.textContent = `${green}/${total}`;
+    $kpiUpdated.textContent = lastTs ? new Date(lastTs).toLocaleString() : '–';
+    $kpiLbl.textContent = $prov.value==='ALL' ? 'Canada' : $prov.value;
+  }
+
+  function clearMarkers(){
+    for(const m of MARKERS){ m.remove(); }
+    MARKERS = [];
+  }
+
+  function render(){
+    const selectedProv = $prov.value;
+    const all = Array.from(STORE_INDEX.values());
+    const filtered = all.filter(s => {
+      if(selectedProv!=='ALL' && (String(s.province||'').toUpperCase()!==selectedProv)) return false;
+      return true;
+    });
+
+    // Center map on province selection (best effort)
+    if(filtered.length){
+      const any = filtered[Math.floor(filtered.length/2)];
+      if(any.lon && any.lat){
+        map.flyTo({ center:[any.lon, any.lat], zoom: selectedProv==='ALL'?4:6, essential:true });
+      }
+    }
+
+    clearMarkers();
+
+    for(const s of filtered){
+      if(s.lat==null || s.lon==null) continue;
+      const c = colorFor(s);
+      const color =
+        c==='green' ? '#22c55e' :
+        c==='red'   ? '#ef4444' :
+                      '#64748b';
+
+      const el = document.createElement('div');
+      el.style.width='12px'; el.style.height='12px'; el.style.borderRadius='999px';
+      el.style.background=color; el.style.boxShadow='0 0 0 2px rgba(0,0,0,.4)';
+
+      const popup = new mapboxgl.Popup({offset:12}).setHTML(`
+        <div style="font-weight:700;margin-bottom:4px">${s.name || 'Tim Hortons'}</div>
+        <div style="font-size:12px;color:#94a3b8">${[s.address,s.city,s.province].filter(Boolean).join(', ')}</div>
+        <div style="margin-top:6px;font-size:12px">
+          État: <b style="color:${color}">${c==='green'?'disponible':c==='red'?'indisponible':'inconnu'}</b>
+        </div>
+      `);
+
+      const marker = new mapboxgl.Marker(el).setLngLat([s.lon, s.lat]).setPopup(popup).addTo(map);
+      MARKERS.push(marker);
+    }
+
+    updateKPIs(filtered);
+  }
+
+  async function refresh(){
+    await fetchData();
+    render();
+  }
+
+  document.getElementById('refresh').addEventListener('click', refresh);
+  document.getElementById('province').addEventListener('change', render);
+
+  // Première charge + auto-refresh (collector tourne aux 20 min)
+  await refresh();
+  setInterval(refresh, 90000);
+})();
+</script>
 </body>
 </html>
