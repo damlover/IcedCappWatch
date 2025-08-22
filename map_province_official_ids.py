@@ -174,22 +174,32 @@ def fetch_candidates(lat: float, lon: float) -> List[dict]:
     return arr
 
 def best_candidate(lat: float, lon: float, cands: List[Dict[str,Any]]) -> Optional[Tuple[str,float]]:
+    # helper: extrait un bloc de chiffres (>=4) depuis un id "mixte"
+    def extract_numeric_id(s: Optional[str]) -> Optional[str]:
+        if not s: return None
+        m = re.search(r"\d{4,}", s)  # au moins 4 chiffres pour éviter les faux positifs
+        return m.group(0) if m else None
+
     best_id, best_d = None, 1e12
     for c in cands:
         try:
-            cid = find_string_by_keys(c, ID_KEYS)
+            id_raw = find_string_by_keys(c, ID_KEYS)  # ex: "TH-123456" ou "123456"
+            cid = extract_numeric_id(id_raw)
+            if not cid:
+                continue
             clat = find_number_by_keys(c, LAT_KEYS)
             clon = find_number_by_keys(c, LON_KEYS)
-            if cid is None or clat is None or clon is None: 
+            if clat is None or clon is None:
                 continue
             d = haversine_m(lat, lon, clat, clon)
             if d < best_d:
                 best_id, best_d = cid, d
         except Exception:
             continue
-    if best_id and re.fullmatch(r"\d+", best_id) and best_d <= MATCH_METERS:
+    if best_id and best_d <= MATCH_METERS:
         return best_id, best_d
     return None
+
 
 def update_store_id(old_id: str, new_id: str) -> bool:
     try:
