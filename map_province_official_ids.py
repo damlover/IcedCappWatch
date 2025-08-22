@@ -174,31 +174,64 @@ def fetch_candidates(lat: float, lon: float) -> List[dict]:
     return arr
 
 def best_candidate(lat: float, lon: float, cands: List[Dict[str,Any]]) -> Optional[Tuple[str,float]]:
-    # helper: extrait un bloc de chiffres (>=4) depuis un id "mixte"
+    # --- helpers ---
     def extract_numeric_id(s: Optional[str]) -> Optional[str]:
         if not s: return None
-        m = re.search(r"\d{4,}", s)  # au moins 4 chiffres pour éviter les faux positifs
+        m = re.search(r"\d{4,}", s)  # garde un bloc de ≥4 chiffres (ex. "TH-123456" -> "123456")
         return m.group(0) if m else None
+
+    def find_coord_pair(d: dict) -> Optional[Tuple[float,float]]:
+        """
+        Cherche un tableau 'coordinates' (ou similaire) contenant 2 nombres.
+        Hypothèse GeoJSON par défaut: [lon, lat] -> retourne (lat, lon).
+        """
+        for k, v in _walk(d):
+            if isinstance(k, str) and k.lower() in {"coordinates", "coord", "geopoint", "location", "point"}:
+                if isinstance(v, (list, tuple)) and len(v) >= 2:
+                    a, b = v[0], v[1]
+                    try:
+                        a = float(a); b = float(b)
+                    except Exception:
+                        continue
+                    # Par défaut GeoJSON = [lon, lat]
+                    lat2, lon2 = b, a
+                    # sécurité: si l'inversion semble absurde, essaie [lat,lon]
+                    if not (-90 <= lat2 <= 90 and -180 <= lon2 <= 180):
+                        lat2, lon2 = a, b
+                    if (-90 <= lat2 <= 90) and (-180 <= lon2 <= 180):
+                        return (lat2, lon2)
+        return None
 
     best_id, best_d = None, 1e12
     for c in cands:
         try:
-            id_raw = find_string_by_keys(c, ID_KEYS)  # ex: "TH-123456" ou "123456"
+            # 1) ID (numérique extrait depuis storeId/_id/storenumber…)
+            id_raw = find_string_by_keys(c, ID_KEYS)  # ex. "TH-123456" ou "123456"
             cid = extract_numeric_id(id_raw)
             if not cid:
                 continue
+
+            # 2) Coords: d'abord latitude/longitude (même imbriqués), sinon tableau coordinates
             clat = find_number_by_keys(c, LAT_KEYS)
             clon = find_number_by_keys(c, LON_KEYS)
             if clat is None or clon is None:
+                pair = find_coord_pair(c)
+                if pair:
+                    clat, clon = pair
+            if clat is None or clon is None:
                 continue
+
+            # 3) Distance et meilleur candidat
             d = haversine_m(lat, lon, clat, clon)
             if d < best_d:
                 best_id, best_d = cid, d
         except Exception:
             continue
+
     if best_id and best_d <= MATCH_METERS:
         return best_id, best_d
     return None
+
 
 
 def update_store_id(old_id: str, new_id: str) -> bool:
