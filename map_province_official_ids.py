@@ -1,9 +1,9 @@
-# map_province_official_ids.py — RestaurantsInput compatible
+# map_province_official_ids.py — Autoprobe des résultats (edges/nodes/items etc.)
 import os, sys, json, math, re, requests
 from typing import Any, Dict, List, Optional, Tuple
 from supabase import create_client, Client
 
-print("MAPPER — RestaurantsInput mode ✅", file=sys.stderr)
+print("MAPPER — autoprobe GraphQL ✅", file=sys.stderr)
 
 # ---- Supabase ----
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -12,32 +12,25 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY", file=sys.stderr); sys.exit(1)
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---- Gateway config (mêmes vars que le collector) ----
+# ---- Gateway config ----
 TIMS_GATEWAY_URL = os.environ.get("TIMS_GATEWAY_URL", "https://use1-prod-th-gateway.rbictg.com/graphql")
 TIMS_AUTH   = os.environ.get("TIMS_AUTH", "")
 TIMS_COOKIE = os.environ.get("TIMS_COOKIE", "")
 TIMS_UA     = os.environ.get("TIMS_UA", "Mozilla/5.0")
 
 HEADERS_JSON = os.environ.get("TIMS_HEADERS_JSON", "")
-EXTRA_VARS   = os.environ.get("TIMS_EXTRA_VARIABLES_JSON", "")
-
-# ---- Nearby via GetRestaurants($input: RestaurantsInput!) ----
 OP  = os.environ.get("TIMS_NEARBY_OPERATION", "GetRestaurants")
 RAW = os.environ.get("TIMS_NEARBY_QUERY")  # texte GraphQL OU JSON "view source" du payload DevTools
 
-# Paramètres RestaurantsInput (env → override)
-FILTER = os.environ.get("TIMS_NEARBY_FILTER", "NEARBY")           # ex: NEARBY
-STATUS = os.environ.get("TIMS_NEARBY_STATUS", "OPEN")             # ex: OPEN
-FIRST  = int(os.environ.get("TIMS_NEARBY_FIRST", "20"))           # ex: 20
-RADIUS = int(os.environ.get("TIMS_NEARBY_RADIUS_METERS", "8000")) # ex: 8000
-try:
-    SERVICE_MODES = json.loads(os.environ.get("TIMS_NEARBY_SERVICE_MODES_JSON", '["pickup"]'))
-    if not isinstance(SERVICE_MODES, list): SERVICE_MODES = ["pickup"]
-except Exception:
-    SERVICE_MODES = ["pickup"]
+# RestaurantsInput paramètres (override via env si besoin)
+FILTER = os.environ.get("TIMS_NEARBY_FILTER", "NEARBY")
+STATUS = os.environ.get("TIMS_NEARBY_STATUS", "OPEN")
+FIRST  = int(os.environ.get("TIMS_NEARBY_FIRST", "20"))
+RADIUS = int(os.environ.get("TIMS_NEARBY_RADIUS_METERS", "15000"))
 
-MATCH_METERS = int(os.environ.get("TIMS_NEARBY_MATCH_METERS", "400"))
+MATCH_METERS = int(os.environ.get("TIMS_NEARBY_MATCH_METERS", "2500"))
 
+# ---------- utils ----------
 def haversine_m(lat1, lon1, lat2, lon2) -> float:
     R = 6371000.0
     from math import radians, sin, cos, sqrt, atan2
@@ -46,7 +39,7 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     a = sin(dphi/2)**2 + cos(phi1)*cos(phi2)*sin(dl/2)**2
     return 2 * R * atan2(sqrt(a), sqrt(1 - a))
 
-def _base_headers() -> Dict[str,str]:
+def _headers() -> Dict[str,str]:
     h = {
         "accept":"application/json",
         "content-type":"application/json",
@@ -61,26 +54,64 @@ def _base_headers() -> Dict[str,str]:
     if TIMS_COOKIE: h["cookie"] = TIMS_COOKIE
     return h
 
-def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
-    """
-    Accepte:
-      - TIMS_NEARBY_QUERY = texte GraphQL (query GetRestaurants($input: ...) { ... })
-      - OU TIMS_NEARBY_QUERY = JSON brut du payload DevTools (objet/array "view source"),
-        on extrait alors operationName/query/variables.input automatiquement.
-    Construit $input conforme RestaurantsInput:
-      { filter, coordinates{userLat,userLng,searchRadius}, first, status, serviceModes }
-    """
-    if not RAW:
-        print("Missing TIMS_NEARBY_QUERY (texte GraphQL ou JSON DevTools)", file=sys.stderr)
-        return []
+# --- extraction robuste de valeurs (id/lat/lon) même si imbriquées ---
+LAT_KEYS = {"latitude","lat"}
+LON_KEYS = {"longitude","lon","lng"}
+ID_KEYS  = {"id","storeid","store_id","storenumber","store_number"}
 
+def _walk(d: Any):
+    if isinstance(d, dict):
+        for k,v in d.items():
+            yield k, v
+            if isinstance(v, (dict, list)):
+                for kv in _walk(v): yield kv
+    elif isinstance(d, list):
+        for it in d:
+            for kv in _walk(it): yield kv
+
+def find_number_by_keys(d: dict, keys: set) -> Optional[float]:
+    # cherche une clé (ou sous-clé) dont le nom matche
+    for k, v in _walk(d):
+        if isinstance(k, str) and k.lower() in keys:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return None
+
+def find_string_by_keys(d: dict, keys: set) -> Optional[str]:
+    for k, v in _walk(d):
+        if isinstance(k, str) and k.lower() in keys:
+            s = str(v).strip()
+            if s:
+                return s
+    return None
+
+def arrays_with_coords(root: Any) -> List[Tuple[str, List[dict]]]:
+    """Retourne les chemins vers des tableaux contenant des objets avec coords repérables."""
+    out = []
+    def walk(o, path):
+        if isinstance(o, list) and o and isinstance(o[0], dict):
+            has = (find_number_by_keys(o[0], LAT_KEYS) is not None) and (find_number_by_keys(o[0], LON_KEYS) is not None)
+            if has:
+                out.append((path, o))
+        elif isinstance(o, dict):
+            for k,v in o.items():
+                walk(v, f"{path}.{k}" if path else k)
+    walk(root, "data")
+    return out
+
+# ---------- GraphQL ----------
+def fetch_candidates(lat: float, lon: float) -> List[dict]:
+    if not RAW:
+        print("Missing TIMS_NEARBY_QUERY", file=sys.stderr)
+        return []
     op  = OP
     qry = None
     payload_vars = {}
 
     raw = RAW
     if raw.strip()[:1] in "[{]":
-        # JSON "view source" du payload DevTools
         try:
             blob = json.loads(raw)
             entry = blob[0] if isinstance(blob, list) and blob else (blob if isinstance(blob, dict) else None)
@@ -94,36 +125,30 @@ def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
         qry = raw
 
     if not (op and qry):
-        print("Missing operationName/query after parsing TIMS_NEARBY_QUERY", file=sys.stderr)
-        return []
+        print("Missing operationName/query after parsing TIMS_NEARBY_QUERY", file=sys.stderr); return []
 
-    # Build RestaurantsInput
+    # RestaurantsInput ($input) standardisé
     input_obj = {
         "filter": FILTER,
-        "coordinates": { "userLat": float(lat), "userLng": float(lon), "searchRadius": int(RADIUS) },
+        "coordinates": {"userLat": float(lat), "userLng": float(lon), "searchRadius": int(RADIUS)},
         "first": int(FIRST),
-        "status": STATUS,
-        "serviceModes": SERVICE_MODES
+        "status": STATUS
+        # serviceModes : optionnel — on n’envoie pas si pas nécessaire
     }
-
-    # Merge doux avec variables.input du payload (sans écraser nos coords/first)
+    # merge doux des variables.input du payload (sans écraser nos coords/first)
     try:
         p_input = payload_vars.get("input") if isinstance(payload_vars, dict) else None
         if isinstance(p_input, dict):
             extra = dict(p_input)
-            for k in ["coordinates", "first"]:
+            for k in ["coordinates","first"]:
                 extra.pop(k, None)
             input_obj.update(extra)
     except Exception:
         pass
 
-    headers = _base_headers()
-    r = requests.post(
-        TIMS_GATEWAY_URL,
-        json={"operationName": op, "variables": {"input": input_obj}, "query": qry},
-        headers=headers, timeout=25
-    )
-
+    r = requests.post(TIMS_GATEWAY_URL,
+                      json={"operationName": op, "variables": {"input": input_obj}, "query": qry},
+                      headers=_headers(), timeout=25)
     if r.status_code != 200:
         print("DEBUG nearby status:", r.status_code, "body:", r.text[:700], file=sys.stderr)
         return []
@@ -134,28 +159,36 @@ def fetch_nearby(lat: float, lon: float, limit: int=5) -> List[Dict[str,Any]]:
         return []
 
     root = data.get("data", {})
-    # Attraper un tableau de magasins (restaurants/items/nodes)
-    for v in root.values():
-        if isinstance(v, list): return v
-        if isinstance(v, dict):
-            if "items" in v and isinstance(v["items"], list): return v["items"]
-            if "nodes" in v and isinstance(v["nodes"], list): return v["nodes"]
-    return []
+    arrs = arrays_with_coords(root)
+    if not arrs:
+        # log d’aide : premières clés rencontrées
+        first_keys = list(root.keys())[:5] if isinstance(root, dict) else type(root).__name__
+        print("HINT: no coord arrays found. data keys:", first_keys, file=sys.stderr)
+        return []
+
+    # Choisit le 1er tableau avec coords
+    path, arr = arrs[0]
+    # Log utile
+    sample = {k: v for k, v in (arr[0].items())} if isinstance(arr[0], dict) else str(type(arr[0]))
+    print(f"HINT: picked array path: {path}; sample keys: {list(sample.keys())[:8]}", file=sys.stderr)
+    return arr
 
 def best_candidate(lat: float, lon: float, cands: List[Dict[str,Any]]) -> Optional[Tuple[str,float]]:
-    best = (None, 1e12)
+    best_id, best_d = None, 1e12
     for c in cands:
         try:
-            cid = str(c.get("id") or c.get("storeId") or "").strip()
-            clat = float(c.get("latitude") or c.get("lat"))
-            clon = float(c.get("longitude") or c.get("lon"))
+            cid = find_string_by_keys(c, ID_KEYS)
+            clat = find_number_by_keys(c, LAT_KEYS)
+            clon = find_number_by_keys(c, LON_KEYS)
+            if cid is None or clat is None or clon is None: 
+                continue
             d = haversine_m(lat, lon, clat, clon)
-            if d < best[1]: best = (cid, d)
+            if d < best_d:
+                best_id, best_d = cid, d
         except Exception:
             continue
-    cid, dist = best
-    if cid and re.fullmatch(r"\d+", cid) and dist <= MATCH_METERS:
-        return cid, dist
+    if best_id and re.fullmatch(r"\d+", best_id) and best_d <= MATCH_METERS:
+        return best_id, best_d
     return None
 
 def update_store_id(old_id: str, new_id: str) -> bool:
@@ -166,10 +199,10 @@ def update_store_id(old_id: str, new_id: str) -> bool:
         print(f"UPDATE {old_id} -> {new_id} failed: {e}", file=sys.stderr)
         return False
 
+# ---------- main ----------
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python map_province_official_ids.py <PROVINCE_CODE>", file=sys.stderr)
-        sys.exit(1)
+        print("Usage: python map_province_official_ids.py <PROVINCE_CODE>", file=sys.stderr); sys.exit(1)
     province = sys.argv[1].upper()
     print("Pilot province:", province)
 
@@ -183,7 +216,7 @@ def main():
         lat, lon = r.get("lat"), r.get("lon")
         if lat is None or lon is None:
             print(f"- skip {sid} (no lat/lon)"); continue
-        cands = fetch_nearby(lat, lon, limit=5)
+        cands = fetch_candidates(lat, lon)
         pick = best_candidate(lat, lon, cands)
         if not pick:
             print(f"- no match ≤{MATCH_METERS}m pour {sid} ({lat},{lon})"); continue
