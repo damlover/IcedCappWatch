@@ -174,73 +174,87 @@ def fetch_candidates(lat: float, lon: float) -> List[dict]:
     return arr
 
 def best_candidate(lat: float, lon: float, cands: List[Dict[str,Any]]) -> Optional[Tuple[str,float]]:
-    # --- helpers ---
+    """
+    1) Essaie normal: si on trouve des coords (lat/lon) dans les items, on prend le plus proche ≤ MATCH_METERS.
+    2) Fallback (pas de coords dispo): on prend le PREMIER item renvoyé (tri NEARBY) et on extrait un ID numérique.
+    """
     def extract_numeric_id(s: Optional[str]) -> Optional[str]:
         if not s: return None
-        m = re.search(r"\d{4,}", s)  # garde un bloc de ≥4 chiffres (ex. "TH-123456" -> "123456")
+        m = re.search(r"\d{4,}", s)  # extrait un bloc de ≥4 chiffres (ex. "TH-123456" -> "123456")
         return m.group(0) if m else None
 
-    def find_coord_pair(d: dict) -> Optional[Tuple[float,float]]:
-        """
-        Cherche un tableau 'coordinates' (ou similaire) contenant 2 nombres.
-        Hypothèse GeoJSON par défaut: [lon, lat] -> retourne (lat, lon).
-        """
-        for k, v in _walk(d):
-            if isinstance(k, str) and k.lower() in {"coordinates", "coord", "geopoint", "location", "point"}:
-                if isinstance(v, (list, tuple)) and len(v) >= 2:
-                    a, b = v[0], v[1]
-                    try:
-                        a = float(a); b = float(b)
-                    except Exception:
-                        continue
-                    # Par défaut GeoJSON = [lon, lat]
-                    lat2, lon2 = b, a
-                    # sécurité: si l'inversion semble absurde, essaie [lat,lon]
-                    if not (-90 <= lat2 <= 90 and -180 <= lon2 <= 180):
-                        lat2, lon2 = a, b
-                    if (-90 <= lat2 <= 90) and (-180 <= lon2 <= 180):
-                        return (lat2, lon2)
-        return None
-
     best_id, best_d = None, 1e12
+    got_coords = False
+
     for c in cands:
         try:
-            # 1) ID (numérique extrait depuis storeId/_id/storenumber…)
             id_raw = find_string_by_keys(c, ID_KEYS)  # ex. "TH-123456" ou "123456"
             cid = extract_numeric_id(id_raw)
             if not cid:
                 continue
-
-            # 2) Coords: d'abord latitude/longitude (même imbriqués), sinon tableau coordinates
             clat = find_number_by_keys(c, LAT_KEYS)
             clon = find_number_by_keys(c, LON_KEYS)
-            if clat is None or clon is None:
-                pair = find_coord_pair(c)
-                if pair:
-                    clat, clon = pair
-            if clat is None or clon is None:
-                continue
-
-            # 3) Distance et meilleur candidat
-            d = haversine_m(lat, lon, clat, clon)
-            if d < best_d:
-                best_id, best_d = cid, d
+            if clat is not None and clon is not None:
+                got_coords = True
+                d = haversine_m(lat, lon, clat, clon)
+                if d < best_d:
+                    best_id, best_d = cid, d
         except Exception:
             continue
 
-    if best_id and best_d <= MATCH_METERS:
+    # Cas 1: on a pu mesurer une distance
+    if got_coords and best_id and best_d <= MATCH_METERS:
         return best_id, best_d
+
+    # Cas 2 (fallback): aucune coordonnée dans la réponse -> on prend le 1er item renvoyé
+    if cands:
+        try:
+            id_raw = find_string_by_keys(cands[0], ID_KEYS)
+            cid = extract_numeric_id(id_raw)
+            if cid:
+                # On renvoie une distance fictive == seuil pour passer le filtre
+                return cid, float(MATCH_METERS)
+        except Exception:
+            pass
+
     return None
 
 
-
 def update_store_id(old_id: str, new_id: str) -> bool:
+    """
+    Met à jour le PK de la ligne kgl_* vers l'ID officiel.
+    Si l'ID officiel existe déjà dans `stores`, on FUSIONNE :
+      - on rattache les checks de old_id -> new_id
+      - on supprime la ligne old_id
+    """
     try:
-        sb.table("stores").update({"store_id": new_id}).eq("store_id", old_id).execute()
-        return True
+        # 1) l'ID officiel existe déjà ?
+        check = sb.table("stores").select("store_id").eq("store_id", new_id).limit(1).execute()
+        exists = bool(check.data)
+
+        if exists:
+            # Fusion douce : checks -> new_id, puis suppression de l'ancienne ligne
+            try:
+                sb.table("checks").update({"store_id": new_id}).eq("store_id", old_id).execute()
+            except Exception as e:
+                print(f"MERGE checks {old_id} -> {new_id} failed: {e}", file=sys.stderr)
+                # on continue quand même, au pire il n'y avait pas de checks
+
+            try:
+                sb.table("stores").delete().eq("store_id", old_id).execute()
+            except Exception as e:
+                print(f"DELETE old store {old_id} failed: {e}", file=sys.stderr)
+
+            return True
+        else:
+            # 2) pas de conflit : on peut mettre à jour le PK directement
+            sb.table("stores").update({"store_id": new_id}).eq("store_id", old_id).execute()
+            return True
+
     except Exception as e:
         print(f"UPDATE {old_id} -> {new_id} failed: {e}", file=sys.stderr)
         return False
+
 
 # ---------- main ----------
 def main():
