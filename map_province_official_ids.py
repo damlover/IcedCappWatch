@@ -2,6 +2,8 @@
 import os, sys, json, math, re, requests
 from typing import Any, Dict, List, Optional, Tuple
 from supabase import create_client, Client
+import time, random
+
 
 print("MAPPER — autoprobe GraphQL ✅", file=sys.stderr)
 
@@ -100,31 +102,30 @@ def arrays_with_coords(root: Any) -> List[Tuple[str, List[dict]]]:
                 walk(v, f"{path}.{k}" if path else k)
     walk(root, "data")
     return out
-def _post_with_retry(url, payload, headers, timeout_sec=30, retries=3, backoff_ms=400):
+def _post_with_retry(url, payload, headers, timeout_sec=40, retries=4, backoff_ms=400):
     for attempt in range(retries + 1):
         try:
             return requests.post(url, json=payload, headers=headers, timeout=timeout_sec)
-        except requests.exceptions.ReadTimeout as e:
+        except requests.exceptions.ReadTimeout:
             print(f"RETRY {attempt+1}/{retries} ReadTimeout", file=sys.stderr)
         except requests.exceptions.RequestException as e:
             print(f"RETRY {attempt+1}/{retries} RequestException: {e}", file=sys.stderr)
-        # petit backoff exponentiel + jitter
-        sleep_s = (backoff_ms / 1000.0) * (2 ** attempt) + random.uniform(0, 0.2)
-        time.sleep(sleep_s)
+        # backoff expo + jitter
+        time.sleep((backoff_ms/1000.0) * (2 ** attempt) + random.uniform(0, 0.2))
     return None
 
-
-# ---------- GraphQL ----------
 def fetch_candidates(lat: float, lon: float) -> List[dict]:
     if not RAW:
         print("Missing TIMS_NEARBY_QUERY", file=sys.stderr)
         return []
+
     op  = OP
     qry = None
     payload_vars = {}
 
     raw = RAW
     if raw.strip()[:1] in "[{]":
+        # JSON "view source" du payload DevTools
         try:
             blob = json.loads(raw)
             entry = blob[0] if isinstance(blob, list) and blob else (blob if isinstance(blob, dict) else None)
@@ -138,17 +139,18 @@ def fetch_candidates(lat: float, lon: float) -> List[dict]:
         qry = raw
 
     if not (op and qry):
-        print("Missing operationName/query after parsing TIMS_NEARBY_QUERY", file=sys.stderr); return []
+        print("Missing operationName/query after parsing TIMS_NEARBY_QUERY", file=sys.stderr)
+        return []
 
-    # RestaurantsInput ($input) standardisé
+    # $input standardisé (RestaurantsInput)
     input_obj = {
         "filter": FILTER,
-        "coordinates": {"userLat": float(lat), "userLng": float(lon), "searchRadius": int(RADIUS)},
+        "coordinates": { "userLat": float(lat), "userLng": float(lon), "searchRadius": int(RADIUS) },
         "first": int(FIRST),
         "status": STATUS
-        # serviceModes : optionnel — on n’envoie pas si pas nécessaire
+        # serviceModes optionnel -> on n’envoie pas si pas requis
     }
-    # merge doux des variables.input du payload (sans écraser nos coords/first)
+    # merge doux avec variables.input du payload (sans écraser coords/first)
     try:
         p_input = payload_vars.get("input") if isinstance(payload_vars, dict) else None
         if isinstance(p_input, dict):
@@ -159,23 +161,27 @@ def fetch_candidates(lat: float, lon: float) -> List[dict]:
     except Exception:
         pass
 
+    # appel avec retry
     timeout_sec = int(os.environ.get("TIMS_REQUEST_TIMEOUT_SEC", "40"))
-retries     = int(os.environ.get("TIMS_REQUEST_RETRIES", "4"))
-backoff_ms  = int(os.environ.get("TIMS_REQUEST_BACKOFF_MS", "400"))
+    retries     = int(os.environ.get("TIMS_REQUEST_RETRIES", "4"))
+    backoff_ms  = int(os.environ.get("TIMS_REQUEST_BACKOFF_MS", "400"))
 
-r = _post_with_retry(
-    TIMS_GATEWAY_URL,
-    {"operationName": op, "variables": {"input": input_obj}, "query": qry},
-    _headers(),
-    timeout_sec=timeout_sec,
-    retries=retries,
-    backoff_ms=backoff_ms,
-)
+    r = _post_with_retry(
+        TIMS_GATEWAY_URL,
+        {"operationName": op, "variables": {"input": input_obj}, "query": qry},
+        _headers(),
+        timeout_sec=timeout_sec,
+        retries=retries,
+        backoff_ms=backoff_ms,
+    )
 
-if r is None:
-    print("DEBUG nearby request: all retries failed", file=sys.stderr)
-    return []
+    if r is None:
+        print("DEBUG nearby request: all retries failed", file=sys.stderr)
+        return []
 
+    if r.status_code != 200:
+        print("DEBUG nearby status:", r.status_code, "body:", r.text[:700], file=sys.stderr)
+        return []
 
     data = r.json()
     if "errors" in data:
@@ -183,19 +189,30 @@ if r is None:
         return []
 
     root = data.get("data", {})
-    arrs = arrays_with_coords(root)
-    if not arrs:
-        # log d’aide : premières clés rencontrées
-        first_keys = list(root.keys())[:5] if isinstance(root, dict) else type(root).__name__
-        print("HINT: no coord arrays found. data keys:", first_keys, file=sys.stderr)
-        return []
 
-    # Choisit le 1er tableau avec coords
-    path, arr = arrs[0]
-    # Log utile
-    sample = {k: v for k, v in (arr[0].items())} if isinstance(arr[0], dict) else str(type(arr[0]))
-    print(f"HINT: picked array path: {path}; sample keys: {list(sample.keys())[:8]}", file=sys.stderr)
-    return arr
+    # 1) Cherche un tableau qui contient des coords explicites
+    arrs = arrays_with_coords(root)
+    if arrs:
+        path, arr = arrs[0]
+        sample = {k: v for k, v in (arr[0].items())} if isinstance(arr[0], dict) else str(type(arr[0]))
+        print(f"HINT: picked array path: {path}; sample keys: {list(sample.keys())[:8] if isinstance(sample, dict) else sample}", file=sys.stderr)
+        return arr
+
+    # 2) Fallback: pas de coords -> retourne restaurants.nodes/items/edges si dispo
+    print("HINT: no coord arrays found. data keys:", list(root.keys())[:5] if isinstance(root, dict) else type(root).__name__, file=sys.stderr)
+    try:
+        restaurants = root.get("restaurants")
+        if isinstance(restaurants, dict):
+            for key in ["nodes", "items", "edges"]:
+                if key in restaurants and isinstance(restaurants[key], list):
+                    arr = restaurants[key]
+                    print(f"HINT: picked array path: data.restaurants.{key}; sample keys: {list(arr[0].keys())[:8] if arr else []}", file=sys.stderr)
+                    return arr
+    except Exception:
+        pass
+
+    return []
+
 
 def best_candidate(lat: float, lon: float, cands: List[Dict[str,Any]]) -> Optional[Tuple[str,float]]:
     """
