@@ -100,6 +100,19 @@ def arrays_with_coords(root: Any) -> List[Tuple[str, List[dict]]]:
                 walk(v, f"{path}.{k}" if path else k)
     walk(root, "data")
     return out
+def _post_with_retry(url, payload, headers, timeout_sec=30, retries=3, backoff_ms=400):
+    for attempt in range(retries + 1):
+        try:
+            return requests.post(url, json=payload, headers=headers, timeout=timeout_sec)
+        except requests.exceptions.ReadTimeout as e:
+            print(f"RETRY {attempt+1}/{retries} ReadTimeout", file=sys.stderr)
+        except requests.exceptions.RequestException as e:
+            print(f"RETRY {attempt+1}/{retries} RequestException: {e}", file=sys.stderr)
+        # petit backoff exponentiel + jitter
+        sleep_s = (backoff_ms / 1000.0) * (2 ** attempt) + random.uniform(0, 0.2)
+        time.sleep(sleep_s)
+    return None
+
 
 # ---------- GraphQL ----------
 def fetch_candidates(lat: float, lon: float) -> List[dict]:
@@ -146,12 +159,23 @@ def fetch_candidates(lat: float, lon: float) -> List[dict]:
     except Exception:
         pass
 
-    r = requests.post(TIMS_GATEWAY_URL,
-                      json={"operationName": op, "variables": {"input": input_obj}, "query": qry},
-                      headers=_headers(), timeout=25)
-    if r.status_code != 200:
-        print("DEBUG nearby status:", r.status_code, "body:", r.text[:700], file=sys.stderr)
-        return []
+    timeout_sec = int(os.environ.get("TIMS_REQUEST_TIMEOUT_SEC", "40"))
+retries     = int(os.environ.get("TIMS_REQUEST_RETRIES", "4"))
+backoff_ms  = int(os.environ.get("TIMS_REQUEST_BACKOFF_MS", "400"))
+
+r = _post_with_retry(
+    TIMS_GATEWAY_URL,
+    {"operationName": op, "variables": {"input": input_obj}, "query": qry},
+    _headers(),
+    timeout_sec=timeout_sec,
+    retries=retries,
+    backoff_ms=backoff_ms,
+)
+
+if r is None:
+    print("DEBUG nearby request: all retries failed", file=sys.stderr)
+    return []
+
 
     data = r.json()
     if "errors" in data:
