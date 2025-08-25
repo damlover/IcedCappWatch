@@ -122,7 +122,9 @@
       .select('*');
     if(e2){ console.error(e2); showToast('Erreur lecture store_latest'); }
 
-    LATEST = new Map((latest || []).map(r => [r.store_id, r]));
+    // store_id peut être number côté DB → on normalise en string pour la Map
+LATEST = new Map((latest || []).map(r => [String(r.store_id), r]));
+
 
     // Provinces dropdown
     const provs = Array.from(new Set((stores||[]).map(s => (s.province||'').toUpperCase()).filter(Boolean))).sort();
@@ -139,12 +141,15 @@
   function updateKPIs(filteredStores){
     let total = 0, green = 0, lastTs = 0;
     for(const s of filteredStores){
-      const L = LATEST.get(s.store_id);
+      const L = LATEST.get(String(s.store_id));
       if(!L) continue;
       total++;
-      const v = (L.is_available ?? L.last_available ?? L.available);
-      if(v) green++;
-      const ts = Date.parse(L.checked_at || L.last_checked_at || L.updated_at || 0);
+      // robustifier le booléen (true / 'true' / 1)
+const v = (L.available === true || L.available === 'true' || L.available === 1);
+
+// la vue a 'updated_at' → on l’utilise en priorité
+const ts = Date.parse(L.updated_at || L.last_checked_at || L.created_at || '');
+
       if(ts && ts>lastTs) lastTs = ts;
     }
     const pct = total ? Math.round((green/total)*100) : 0;
